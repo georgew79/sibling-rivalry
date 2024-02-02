@@ -6,21 +6,20 @@
 import torch
 from base.actors.base import BaseActor
 from base.learners.distance import BaseDistanceLearner, BaseSiblingRivalryLearner
-from agents.pixgrid_agents.modules import StochasticPolicy, Value
-from agents.pixgrid_agents.pixgrid_env import Env
-
+from base.learners.grid_oracle import BaseGridOracleLearner
+from agents.pulse_agents.modules import StochasticPolicy, Value
+from agents.pulse_agents.modules import IntrinsicCuriosityModule, RandomNetworkDistillation
+from agents.pulse_agents.pulse_env import Env
 
 class StochasticAgent(BaseActor):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.batch_keys = [
-            'state', 'next_state', 'goal', 'mask',
-            'action', 'n_ent', 'log_prob',
-            'reward', 'terminal', 'complete'
+            'state', 'next_state', 'goal',
+            'action', 'n_ent', 'log_prob', 'action_logit',
+            'reward', 'terminal', 'complete',
         ]
-        self.no_squeeze_list = [
-            'state', 'next_state', 'goal'
-        ]
+        self.no_squeeze_list = []
 
     def _make_modules(self, policy):
         self.policy = policy
@@ -28,51 +27,63 @@ class StochasticAgent(BaseActor):
     def step(self, do_eval=False):
         s = self.env.state
         g = self.env.goal
-        mask = self.env.action_mask()
-        a, log_prob, n_ent = self.policy(s[None], g[None], mask[None], greedy=do_eval)
-        a = a.view([])
+        a, logit, log_prob, n_ent = self.policy(s.view(1, -1), g.view(1, -1), greedy=do_eval)
+        a = a.view(-1)
+        logit = logit.view(-1)
         log_prob = log_prob.sum()
-        n_ent = n_ent.mean()
 
         self.env.step(a)
         complete = float(self.env.is_success) * torch.ones(1)
         terminal = float(self.env.is_done) * torch.ones(1)
         s_next = self.env.state
-        m_next = self.env.action_mask()
         r = -1 * torch.ones(1)
 
         self.episode.append({
             'state': s,
             'goal': g,
-            'mask': mask,
             'action': a,
-            'log_prob': log_prob,
-            'n_ent': n_ent,
+            'action_logit': logit,
+            'log_prob': log_prob.view([]),
+            'n_ent': n_ent.view([]),
             'next_state': s_next,
-            'next_mask': m_next,
-            'reward': r.view([]),
             'terminal': terminal.view([]),
             'complete': complete.view([]),
+            'reward': r.view([]),
         })
 
     @property
     def rollout(self):
         states = torch.stack([e['state'] for e in self.episode] + [self.episode[-1]['next_state']]).data.numpy()
-        grids = states[:, 0]
-        locs = states[:, 1]
-        return grids, locs
+        xs = states[:, 0]
+        ys = states[:, 1]
+        return [xs, ys]
 
 
 class DistanceLearner(BaseDistanceLearner):
+    AGENT_TYPE = 'Distance'
     def create_env(self):
         return Env(**self.env_params)
 
     def _make_agent_modules(self):
-        self.policy = StochasticPolicy(self._dummy_env.W)
-        self.v_module = Value(self._dummy_env.W, use_antigoal=False)
+        self.policy = StochasticPolicy(self._dummy_env, 256)
+        self.v_module = Value(self._dummy_env, 256, use_antigoal=False)
 
     def _make_agent(self):
         return StochasticAgent(env=self.create_env(), policy=self.policy)
+
+    def _make_im_modules(self):
+        """Only gets called if 'im_params' config argument is not None (default=None)."""
+        im_support = {
+            'icm': IntrinsicCuriosityModule,
+            'rnd': RandomNetworkDistillation
+        }
+        if self.im_type.lower() not in im_support:
+            raise ValueError('Intrinsic Motivation type {} not recognized. Options are:\n{}'.format(
+                self.im_type.lower(),
+                '\n'.join([k for k in im_support.keys()])
+            ))
+        im_class = im_support[self.im_type.lower()]
+        return im_class(env=self._dummy_env, hidden_size=128)
 
     def get_values(self, batch):
         return self.v_module(
@@ -93,11 +104,11 @@ class DistanceLearner(BaseDistanceLearner):
         )
 
     def get_policy_lprobs_and_nents(self, batch):
-        _, log_prob, n_ent = self.policy(
-            batch['state'], batch['goal'], batch['mask'],
-            action=batch['action']
+        log_prob, n_ent, _ = self.policy(
+            batch['state'], batch['goal'],
+            action_logit=batch['action_logit']
         )
-        return log_prob, n_ent
+        return log_prob.sum(dim=1), n_ent
 
     def get_icm_loss(self, batch):
         return self.icm(batch['state'], batch['next_state'], batch['action'])
@@ -105,11 +116,14 @@ class DistanceLearner(BaseDistanceLearner):
 
 class SiblingRivalryLearner(BaseSiblingRivalryLearner, DistanceLearner):
     def _make_agent_modules(self):
-        self.policy = StochasticPolicy(self._dummy_env.W)
-        self.v_module = Value(self._dummy_env.W, use_antigoal=self.use_antigoal)
+        self.policy = StochasticPolicy(self._dummy_env, 256)
+        self.v_module = Value(self._dummy_env, 256, use_antigoal=self.use_antigoal)
 
     def _make_agent(self):
         agent = super()._make_agent()
         agent.batch_keys.append('antigoal')
-        agent.no_squeeze_list.append('antigoal')
         return agent
+
+
+class GridOracleLearner(BaseGridOracleLearner, DistanceLearner):
+    AGENT_TYPE = 'GridOracle'
